@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { db, getEdges, getEvidence } from './db';
-import { cycleAfterAdding, findCycle, findRedundantEdges, planPrune, queryOrder, topoLevels } from './graph';
+import { cycleAfterAdding, findCycle, findRedundantEdges, mergeConflict, planMergeEdges, planPrune, queryOrder, topoLevels } from './graph';
 import { resetWithSample, seedIfEmpty } from './seed';
 import type { Evidence, GraphState, OrderQueryResult, OrderWitness, PruneResult, RedundancyReport } from './types';
 
@@ -83,6 +83,64 @@ app.put('/api/evidence/:id', (req, res) => {
 app.delete('/api/evidence/:id', (req, res) => {
   const r = db.prepare('DELETE FROM evidence WHERE id = ?').run(req.params.id);
   if (r.changes === 0) return res.status(404).json({ message: '证据卡片不存在' });
+  res.json(buildState());
+});
+
+/* ---------- 重复证据合并 ---------- */
+
+/**
+ * 事务内若发现合并冲突（自环 / 有向环）则抛出该错误，
+ * better-sqlite3 会整体回滚，保证不留下任何半截改接。
+ */
+class MergeConflictError extends Error {
+  conflict: { kind: 'self-loop' | 'cycle'; path: string[] };
+  constructor(conflict: { kind: 'self-loop' | 'cycle'; path: string[] }) {
+    super('merge conflict');
+    this.conflict = conflict;
+  }
+}
+
+app.post('/api/evidence/merge', (req, res) => {
+  const { sourceId, targetId } = (req.body ?? {}) as Record<string, unknown>;
+  if (typeof sourceId !== 'string' || typeof targetId !== 'string') {
+    return res.status(400).json({ message: 'sourceId 与 targetId 均为必填' });
+  }
+  if (sourceId === targetId) {
+    return res.status(400).json({ message: '源卡片与保留卡片不能是同一张卡片' });
+  }
+  const ids = new Set(getEvidence().map((e) => e.id));
+  if (!ids.has(sourceId) || !ids.has(targetId)) {
+    return res.status(404).json({ message: '证据卡片不存在，请刷新后重试' });
+  }
+
+  const tx = db.transaction(() => {
+    // 事务内校验：改接会产生自环或有向环时记录冲突路径并整体回滚
+    const conflict = mergeConflict(getEdges(), sourceId, targetId);
+    if (conflict) throw new MergeConflictError(conflict);
+
+    // 源卡的全部入边、出边改接到保留卡；重复连线只留一条（删除源侧那条）
+    const { deleteIds, rewire } = planMergeEdges(getEdges(), sourceId, targetId);
+    const delEdge = db.prepare('DELETE FROM edges WHERE id = ?');
+    for (const id of deleteIds) delEdge.run(id);
+    const moveEdge = db.prepare('UPDATE edges SET from_id = ?, to_id = ? WHERE id = ?');
+    for (const e of rewire) moveEdge.run(e.fromId, e.toId, e.id);
+
+    // 最后删除源卡（保留卡的标题、来源、时间、描述均不改动）
+    db.prepare('DELETE FROM evidence WHERE id = ?').run(sourceId);
+  });
+
+  try {
+    tx();
+  } catch (e) {
+    if (e instanceof MergeConflictError) {
+      const message =
+        e.conflict.kind === 'self-loop'
+          ? '合并会产生自环约束，已整体拒绝（未做任何改动）'
+          : '合并会形成循环依赖，已整体拒绝（未做任何改动）';
+      return res.status(409).json({ message, merge: e.conflict, cycle: e.conflict.path });
+    }
+    throw e;
+  }
   res.json(buildState());
 });
 

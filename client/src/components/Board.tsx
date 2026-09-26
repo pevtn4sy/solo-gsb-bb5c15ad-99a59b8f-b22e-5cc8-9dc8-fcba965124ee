@@ -13,6 +13,8 @@ interface BoardProps {
   state: GraphState;
   conflict: Conflict | null;
   linkFrom: string | null;
+  /** 合并重复证据模式：true=待选源卡片；字符串=已选源卡片 id、待选保留卡片；false=未启用 */
+  mergeMode: boolean | string;
   /** 瘦身面板选中的冗余连线：高亮原连线与其替代路径 */
   pruneFocus: RedundantEdge | null;
   /** 顺序查询：高亮判定所依据的约束路径（节点 id 序列） */
@@ -22,6 +24,7 @@ interface BoardProps {
   onStartLink: (id: string) => void;
   onCancelLink: () => void;
   onConnect: (fromId: string, toId: string) => void;
+  onMergeSelect: (id: string) => void;
   onEdit: (ev: Evidence) => void;
   onDelete: (ev: Evidence) => void;
   onDeleteEdge: (id: number) => void;
@@ -93,14 +96,23 @@ export default function Board(props: BoardProps) {
   const conflictEdgeKeys = useMemo(() => {
     const s = new Set<string>();
     if (conflict) {
-      // cycle = [尝试的起点, 尝试的终点, …, 起点]；跳过首对（那是被拒绝的新边），其余为图中已有边
-      for (let i = 1; i < conflict.cycle.length - 1; i++) {
-        s.add(`${conflict.cycle[i]}->${conflict.cycle[i + 1]}`);
+      if (conflict.merge) {
+        // 合并冲突：cycle 是当前图中导致冲突的真实路径（自环/成环），路径上的边全部标红
+        for (let i = 0; i < conflict.cycle.length - 1; i++) {
+          s.add(`${conflict.cycle[i]}->${conflict.cycle[i + 1]}`);
+        }
+      } else {
+        // cycle = [尝试的起点, 尝试的终点, …, 起点]；跳过首对（那是被拒绝的新边），其余为图中已有边
+        for (let i = 1; i < conflict.cycle.length - 1; i++) {
+          s.add(`${conflict.cycle[i]}->${conflict.cycle[i + 1]}`);
+        }
       }
     }
     return s;
   }, [conflict]);
-  const attempted = conflict && conflict.cycle.length >= 2 ? { from: conflict.cycle[0], to: conflict.cycle[1] } : null;
+  // 合并冲突路径由图中已有边构成，无需绘制「被否决的新边」虚线
+  const attempted =
+    conflict && !conflict.merge && conflict.cycle.length >= 2 ? { from: conflict.cycle[0], to: conflict.cycle[1] } : null;
 
   /* 瘦身高亮：原连线（琥珀色）+ 替代路径经过的边与节点（绿色） */
   const pruneAltEdgeKeys = useMemo(() => {
@@ -161,6 +173,7 @@ export default function Board(props: BoardProps) {
   };
 
   const startLinkDrag = (e: ReactPointerEvent, id: string) => {
+    if (props.mergeMode !== false) return;
     e.preventDefault();
     e.stopPropagation();
     boardRef.current?.setPointerCapture(e.pointerId);
@@ -190,6 +203,10 @@ export default function Board(props: BoardProps) {
   };
 
   const onCardClick = (ev: Evidence) => {
+    if (props.mergeMode !== false) {
+      props.onMergeSelect(ev.id);
+      return;
+    }
     if (!linkFrom) return;
     if (linkFrom === ev.id) props.onCancelLink();
     else props.onConnect(linkFrom, ev.id);
@@ -302,6 +319,8 @@ export default function Board(props: BoardProps) {
               const inConflict = conflictNodes.has(ev.id);
               const isSource = linkFrom === ev.id;
               const isTarget = linkFrom !== null && linkFrom !== ev.id;
+              const isMergeSource = props.mergeMode === ev.id;
+              const isMergePick = props.mergeMode !== false && !isMergeSource;
               const isPruneEndpoint =
                 props.pruneFocus !== null && (props.pruneFocus.fromId === ev.id || props.pruneFocus.toId === ev.id);
               const isPrunePath = !isPruneEndpoint && prunePathNodes.has(ev.id);
@@ -315,6 +334,8 @@ export default function Board(props: BoardProps) {
                     inConflict ? 'in-conflict' : '',
                     isSource ? 'link-source' : '',
                     isTarget ? 'link-target' : '',
+                    isMergeSource ? 'merge-source' : '',
+                    isMergePick ? 'merge-pick' : '',
                     isPruneEndpoint ? 'prune-endpoint' : '',
                     isPrunePath ? 'prune-path' : '',
                     isOrderPath ? 'order-path' : '',
@@ -357,6 +378,11 @@ export default function Board(props: BoardProps) {
                     </button>
                   </div>
                   {isTarget && <div className="target-hint">点击：使「{byId.get(linkFrom!)?.title}」必须早于本卡</div>}
+                  {isMergeSource && <div className="target-hint merge-hint-inline">源卡片（将删除）：点击其他卡片选作保留卡，或再次点击取消</div>}
+                  {isMergePick && props.mergeMode === true && <div className="target-hint merge-hint-inline">点击：选为源卡片（合并后删除）</div>}
+                  {isMergePick && props.mergeMode !== true && (
+                    <div className="target-hint merge-hint-inline">点击：保留本卡，把「{byId.get(props.mergeMode as string)?.title}」合并进来</div>
+                  )}
                 </article>
               );
             })}

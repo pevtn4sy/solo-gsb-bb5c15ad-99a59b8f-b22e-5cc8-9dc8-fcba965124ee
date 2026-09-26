@@ -44,6 +44,15 @@ export interface PruneResult extends GraphState {
   skipped: number[];
 }
 
+/** 合并失败原因：改接后产生自环 / 有向环 */
+export type MergeConflictKind = 'self-loop' | 'cycle';
+
+/** 合并冲突：当前图中导致改接失败的一条真实路径（自环时为两端点） */
+export interface MergeConflict {
+  kind: MergeConflictKind;
+  path: string[];
+}
+
 /** 顺序确定性查询的判定结论 */
 export type OrderRelation = 'a-before-b' | 'b-before-a' | 'unconstrained';
 

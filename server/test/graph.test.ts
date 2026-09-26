@@ -5,6 +5,8 @@ import {
   findCycle,
   findPath,
   findRedundantEdges,
+  mergeConflict,
+  planMergeEdges,
   planPrune,
   queryOrder,
   stableTopoOrder,
@@ -276,4 +278,133 @@ test('queryOrder：顺序未被约束时给出双向见证拓扑序', () => {
 
 test('queryOrder：同一卡片返回 null', () => {
   assert.equal(queryOrder(nodesOf(['a']), [], 'a', 'a'), null);
+});
+
+/* ---------- 重复证据合并 ---------- */
+
+test('mergeConflict：无关节点合并无冲突', () => {
+  const edges = [
+    { fromId: 'a', toId: 'b' },
+    { fromId: 'c', toId: 'd' },
+  ];
+  assert.equal(mergeConflict(edges, 'a', 'c'), null);
+  assert.equal(mergeConflict(edges, 'd', 'b'), null);
+});
+
+test('mergeConflict：直接约束改接成自环，返回 self-loop 与两端点', () => {
+  const edges = [{ fromId: 's', toId: 't' }];
+  assert.deepEqual(mergeConflict(edges, 's', 't'), { kind: 'self-loop', path: ['s', 't'] });
+  assert.deepEqual(mergeConflict(edges, 't', 's'), { kind: 'self-loop', path: ['s', 't'] });
+});
+
+test('mergeConflict：源可达保留（无直连），改接后成环，返回 cycle 路径', () => {
+  // s → x → t：s 可达 t。改接入边会让 t 沿路径回到 s 再指向 t，形成闭环
+  const edges = [
+    { fromId: 's', toId: 'x' },
+    { fromId: 'x', toId: 't' },
+  ];
+  const c = mergeConflict(edges, 's', 't')!;
+  assert.equal(c.kind, 'cycle');
+  assert.deepEqual(c.path, ['s', 'x', 't']);
+});
+
+test('mergeConflict：保留可达源（无直连），改接入边成环，返回反方向 cycle 路径', () => {
+  const edges = [
+    { fromId: 't', toId: 'x' },
+    { fromId: 'x', toId: 's' },
+  ];
+  const c = mergeConflict(edges, 's', 't')!;
+  assert.equal(c.kind, 'cycle');
+  assert.deepEqual(c.path, ['t', 'x', 's']);
+});
+
+test('planMergeEdges：全部入边、出边改接到保留卡', () => {
+  const edges = [
+    { id: 1, fromId: 'a', toId: 's' },
+    { id: 2, fromId: 's', toId: 'b' },
+    { id: 3, fromId: 'x', toId: 'y' },
+  ];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.deepEqual(plan.deleteIds, []);
+  assert.deepEqual(plan.rewire, [
+    { id: 1, fromId: 'a', toId: 't' },
+    { id: 2, fromId: 't', toId: 'b' },
+  ]);
+});
+
+test('planMergeEdges：重复连线只留保留卡侧一条，删除源侧重复边', () => {
+  const edges = [
+    { id: 1, fromId: 'a', toId: 's' }, // 改接为 a→t
+    { id: 2, fromId: 'a', toId: 't' }, // 已存在 a→t：边 1 重复，删除
+    { id: 3, fromId: 's', toId: 'b' }, // 改接为 t→b
+    { id: 4, fromId: 't', toId: 'b' }, // 已存在 t→b：边 3 重复，删除
+    { id: 5, fromId: 's', toId: 'c' }, // 无重复：改接为 t→c
+  ];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.deepEqual(plan.deleteIds.sort(), [1, 3]);
+  assert.deepEqual(plan.rewire, [{ id: 5, fromId: 't', toId: 'c' }]);
+});
+
+test('planMergeEdges：与源卡无关的连线原样保留', () => {
+  const edges = [
+    { id: 1, fromId: 'a', toId: 's' },
+    { id: 2, fromId: 's', toId: 'b' },
+    { id: 3, fromId: 'x', toId: 'y' },
+    { id: 4, fromId: 't', toId: 'z' },
+  ];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.deepEqual(plan.deleteIds, []);
+  assert.deepEqual(plan.rewire.map((e) => e.id).sort(), [1, 2]);
+});
+
+test('合并改接（去重后）不产生环，剩余图仍然无环', () => {
+  // 可合并的场景：s 与 t 互不达
+  const edges = [
+    { id: 1, fromId: 'a', toId: 's' },
+    { id: 2, fromId: 's', toId: 'b' },
+    { id: 3, fromId: 'c', toId: 't' },
+  ];
+  assert.equal(mergeConflict(edges, 's', 't'), null);
+  const plan = planMergeEdges(edges, 's', 't');
+  const remaining = edges
+    .filter((e) => !plan.deleteIds.includes(e.id))
+    .map((e) => {
+      const m = plan.rewire.find((r) => r.id === e.id);
+      return m ? { fromId: m.fromId, toId: m.toId } : { fromId: e.fromId, toId: e.toId };
+    })
+    .filter((e) => e.fromId !== 's' && e.toId !== 's');
+  const ids = ['a', 'b', 'c', 't'];
+  assert.notEqual(topoLevels(ids, remaining), null);
+});
+
+test('事务模拟：任意可合并场景执行计划后无重复连线、无自环、无环', () => {
+  // 较复杂场景：s 同时有多个入边/出边，部分与保留卡侧重复
+  const edges = [
+    { id: 1, fromId: 'a', toId: 's' },
+    { id: 2, fromId: 'b', toId: 's' },
+    { id: 3, fromId: 'a', toId: 't' }, // a→t 已存在 => 边 1 改接后重复
+    { id: 4, fromId: 's', toId: 'c' },
+    { id: 5, fromId: 't', toId: 'd' },
+    { id: 6, fromId: 's', toId: 'd' }, // t→d 已存在 => 边 6 重复
+    { id: 7, fromId: 'x', toId: 'y' }, // 完全无关
+  ];
+  assert.equal(mergeConflict(edges, 's', 't'), null);
+  const plan = planMergeEdges(edges, 's', 't');
+  const finalEdges = edges
+    .filter((e) => !plan.deleteIds.includes(e.id))
+    .map((e) => plan.rewire.find((r) => r.id === e.id) ?? e)
+    .filter((e) => e.fromId !== 's' && e.toId !== 's');
+
+  // 无自环
+  assert.ok(finalEdges.every((e) => e.fromId !== e.toId));
+  // 无重复 (from, to) 对（对应 edges 表 UNIQUE(from_id, to_id)）
+  const keys = finalEdges.map((e) => `${e.fromId}->${e.toId}`);
+  assert.equal(new Set(keys).size, keys.length);
+  // 无环
+  assert.equal(findCycle(['a', 'b', 'c', 'd', 'x', 'y', 't'], finalEdges), null);
+  // 保留卡继承了去重后的邻接：a→t 仅一条，t→c、t→d 各一条
+  assert.deepEqual(
+    keys.sort(),
+    ['a->t', 'b->t', 't->c', 't->d', 'x->y'],
+  );
 });

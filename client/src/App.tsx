@@ -6,11 +6,13 @@ import ConflictBanner from './components/ConflictBanner';
 import OrderQueryPanel from './components/OrderQueryPanel';
 import PrunePanel from './components/PrunePanel';
 import TimelinePanel from './components/TimelinePanel';
-import type { Evidence, EvidenceFormValues, GraphState, OrderWitness, RedundantEdge } from './types';
+import type { Evidence, EvidenceFormValues, GraphState, MergeConflict, OrderWitness, RedundantEdge } from './types';
 
 export interface Conflict {
   cycle: string[];
   message: string;
+  /** 由「合并重复证据」触发时附带的冲突详情（自环 / 有向环） */
+  merge?: MergeConflict;
 }
 
 export default function App() {
@@ -18,6 +20,8 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [conflict, setConflict] = useState<Conflict | null>(null);
   const [linkFrom, setLinkFrom] = useState<string | null>(null);
+  /** 重复证据合并：true=待选源卡片；字符串=已选源卡片 id、待选保留卡片；false=未启用 */
+  const [mergeMode, setMergeMode] = useState<boolean | string>(false);
   const [editing, setEditing] = useState<Evidence | 'new' | null>(null);
   const [busy, setBusy] = useState(false);
   const [redundant, setRedundant] = useState<RedundantEdge[]>([]);
@@ -56,6 +60,7 @@ export default function App() {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape') {
         setLinkFrom(null);
+        setMergeMode(false);
         setEditing(null);
         setOrderPath(null);
         setOrderPreview(null);
@@ -128,6 +133,65 @@ export default function App() {
     [run],
   );
 
+  /** 确认后把源卡合并进保留卡：保留卡标题/来源/时间/描述不变，连线由服务端事务改接 */
+  const mergeCards = useCallback(
+    async (sourceId: string, targetId: string) => {
+      const source = state?.evidence.find((e) => e.id === sourceId);
+      const target = state?.evidence.find((e) => e.id === targetId);
+      if (!source || !target) {
+        setMergeMode(false);
+        return;
+      }
+      if (
+        !window.confirm(
+          `将重复证据「${source.title}」合并进「${target.title}」？\n\n` +
+            `· 源卡「${source.title}」将被删除\n` +
+            `· 它的全部「必须早于」连线会改接到保留卡，重复连线只保留一条\n` +
+            `· 保留卡的标题、来源、发生时间和描述保持不变\n\n` +
+            `若改接会产生自环或循环依赖，将整体拒绝并高亮冲突路径。`,
+        )
+      ) {
+        return;
+      }
+      setBusy(true);
+      try {
+        setState(await api.mergeEvidence(sourceId, targetId));
+        setConflict(null);
+        setLinkFrom(null);
+        setError(null);
+      } catch (e) {
+        if (e instanceof ApiError && e.payload.merge) {
+          setConflict({
+            cycle: e.payload.merge.path,
+            message: e.payload.message ?? e.message,
+            merge: { kind: e.payload.merge.kind, path: e.payload.merge.path, sourceId, targetId },
+          });
+          setError(null);
+        } else {
+          handleApiError(e);
+        }
+      } finally {
+        setBusy(false);
+        setMergeMode(false);
+      }
+    },
+    [state, handleApiError],
+  );
+
+  /** 合并模式下选择卡片：第一张为源卡片，第二张为保留卡片；再次点击源卡片退出 */
+  const onMergeSelect = useCallback(
+    (id: string) => {
+      if (mergeMode === false || mergeMode === true) {
+        setMergeMode(id);
+      } else if (mergeMode === id) {
+        setMergeMode(false);
+      } else {
+        void mergeCards(mergeMode, id);
+      }
+    },
+    [mergeMode, mergeCards],
+  );
+
   const onImportFile = useCallback(
     async (file: File) => {
       let payload: unknown;
@@ -179,6 +243,17 @@ export default function App() {
         <div className="toolbar">
           <button className="btn primary" onClick={() => setEditing('new')} disabled={busy}>
             ＋ 新增证据
+          </button>
+          <button
+            className={`btn${mergeMode !== false ? ' active' : ''}`}
+            onClick={() => {
+              setMergeMode((m) => (m === false ? true : false));
+              setLinkFrom(null);
+            }}
+            disabled={busy}
+            title="先点选源卡片（被合并、将删除），再点选保留卡片"
+          >
+            ⛓ 合并重复证据
           </button>
           <button className="btn" onClick={() => fileRef.current?.click()} disabled={busy}>
             导入 JSON
@@ -254,6 +329,18 @@ export default function App() {
         </div>
       )}
 
+      {mergeMode !== false && (
+        <div className="link-hint merge-hint">
+          {mergeMode === true ? (
+            <>合并模式：先点击作为<b>源卡片</b>的重复证据（合并后将被删除），再点击保留卡片（Esc 取消）</>
+          ) : (
+            <>
+              合并模式：已选源卡片「{titleOf(mergeMode)}」，现在点击要<b>保留</b>的卡片；再次点击源卡片或按 Esc 取消
+            </>
+          )}
+        </div>
+      )}
+
       <main className="main">
         {state ? (
           <>
@@ -261,12 +348,14 @@ export default function App() {
               state={state}
               conflict={conflict}
               linkFrom={linkFrom}
+              mergeMode={mergeMode}
               pruneFocus={pruneFocus}
               orderPath={orderPath}
               preview={orderPreview}
               onStartLink={setLinkFrom}
               onCancelLink={() => setLinkFrom(null)}
               onConnect={connect}
+              onMergeSelect={onMergeSelect}
               onEdit={setEditing}
               onDelete={deleteCard}
               onDeleteEdge={deleteEdge}

@@ -1,9 +1,9 @@
-import type { EvidenceFormValues, GraphState, OrderQueryResult, PruneResult, RedundantEdge } from './types';
+import type { EvidenceFormValues, GraphState, MergeConflictKind, OrderQueryResult, PruneResult, RedundantEdge } from './types';
 
 export class ApiError extends Error {
   status: number;
-  payload: { message?: string; cycle?: string[] };
-  constructor(status: number, payload: { message?: string; cycle?: string[] }) {
+  payload: { message?: string; cycle?: string[]; merge?: { kind: MergeConflictKind; path: string[] } };
+  constructor(status: number, payload: { message?: string; cycle?: string[]; merge?: { kind: MergeConflictKind; path: string[] } }) {
     super(payload.message ?? `请求失败（${status}）`);
     this.status = status;
     this.payload = payload;
@@ -12,7 +12,7 @@ export class ApiError extends Error {
 
 async function request<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
-  const data = (await res.json().catch(() => ({}))) as { message?: string; cycle?: string[] };
+  const data = (await res.json().catch(() => ({}))) as { message?: string; cycle?: string[]; merge?: { kind: MergeConflictKind; path: string[] } };
   if (!res.ok) throw new ApiError(res.status, data);
   return data as T;
 }
@@ -30,6 +30,8 @@ export const api = {
   createEvidence: (body: EvidenceFormValues) => request<GraphState>('/api/evidence', json('POST', body)),
   updateEvidence: (id: string, body: EvidenceFormValues) => request<GraphState>(`/api/evidence/${id}`, json('PUT', body)),
   deleteEvidence: (id: string) => request<GraphState>(`/api/evidence/${id}`, { method: 'DELETE' }),
+  mergeEvidence: (sourceId: string, targetId: string) =>
+    request<GraphState>('/api/evidence/merge', json('POST', { sourceId, targetId })),
   createEdge: (fromId: string, toId: string) => request<GraphState>('/api/edges', json('POST', { fromId, toId })),
   deleteEdge: (id: number) => request<GraphState>(`/api/edges/${id}`, { method: 'DELETE' }),
   redundancy: () => request<{ redundant: RedundantEdge[] }>('/api/redundancy'),

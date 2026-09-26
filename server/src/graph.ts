@@ -94,6 +94,74 @@ export function planPrune<T extends EdgeLike & { id: number }>(
   return { remove, skipped };
 }
 
+/* ---------- 重复证据合并 ---------- */
+
+/** 合并失败原因：改接后产生自环 / 有向环 */
+export type MergeConflictKind = 'self-loop' | 'cycle';
+
+export interface MergeConflict {
+  kind: MergeConflictKind;
+  /**
+   * 冲突路径（当前图中的真实节点序列，沿路径相邻节点即真实边）：
+   * - self-loop：与那条将变成自环的直接约束同向的两端点序列（s→t 或 t→s）
+   * - cycle：在当前图中导致改接成环的一条真实路径（首尾分别为 sourceId / targetId）
+   */
+  path: string[];
+}
+
+/**
+ * 校验把源卡 sourceId 合并进保留卡 targetId（改接全部入边、出边）是否会产生自环或有向环。
+ *
+ * 在当前无环图上，改接后成环（含自环）当且仅当 sourceId 与 targetId 之间在当前图中存在直接约束，
+ * 或沿已有边存在一条可达路径：
+ * - 两者直接相连（s→t 或 t→s）：对端改接后该边变成 target→target 自环；
+ * - sourceId 可达 targetId：sourceId 的出边改接到 target 后形成闭环；
+ * - targetId 可达 sourceId：sourceId 的入边改接自 target 后形成闭环。
+ * 直接约束优先判定为自环（即最直观的冲突路径），否则按可达方向返回冲突路径；无冲突返回 null。
+ */
+export function mergeConflict(edges: EdgeLike[], sourceId: string, targetId: string): MergeConflict | null {
+  const directST = edges.some((e) => e.fromId === sourceId && e.toId === targetId);
+  const directTS = edges.some((e) => e.fromId === targetId && e.toId === sourceId);
+  if (directST) return { kind: 'self-loop', path: [sourceId, targetId] };
+  if (directTS) return { kind: 'self-loop', path: [targetId, sourceId] };
+  const sToT = findPath(edges, sourceId, targetId);
+  if (sToT) return { kind: 'cycle', path: sToT };
+  const tToS = findPath(edges, targetId, sourceId);
+  if (tToS) return { kind: 'cycle', path: tToS };
+  return null;
+}
+
+/**
+ * 制定合并改接计划：源卡 sourceId 的全部入边、出边改接到 targetId，重复连线只留一条。
+ * 调用前须先通过 mergeConflict 校验（计划假设改接不会产生自环/有向环）。
+ *
+ * 去重规则（与 edges 表 UNIQUE(from_id, to_id) 一致）：
+ * - 与源卡相连的入边（x→sourceId）、出边（sourceId→x）改接到 targetId；
+ * - 改接后与保留卡已有连线（x→targetId / targetId→x）重复的，删除源侧那一条；
+ * - 与源卡无关节点间的连线原样保留。
+ * 返回需要删除的边 id（重复边）与需要改接的边（id + 新端点）；其余边保持不变。
+ */
+export function planMergeEdges<T extends EdgeLike & { id: number }>(
+  edges: T[],
+  sourceId: string,
+  targetId: string,
+): { deleteIds: number[]; rewire: Array<{ id: number; fromId: string; toId: string }> } {
+  const incoming = new Set(edges.filter((e) => e.toId === targetId).map((e) => e.fromId));
+  const outgoing = new Set(edges.filter((e) => e.fromId === targetId).map((e) => e.toId));
+  const deleteIds: number[] = [];
+  const rewire: Array<{ id: number; fromId: string; toId: string }> = [];
+  for (const e of edges) {
+    if (e.toId === sourceId && e.fromId !== targetId) {
+      if (incoming.has(e.fromId)) deleteIds.push(e.id);
+      else rewire.push({ id: e.id, fromId: e.fromId, toId: targetId });
+    } else if (e.fromId === sourceId && e.toId !== targetId) {
+      if (outgoing.has(e.toId)) deleteIds.push(e.id);
+      else rewire.push({ id: e.id, fromId: targetId, toId: e.toId });
+    }
+  }
+  return { deleteIds, rewire };
+}
+
 /**
  * 校验「新增一条 fromId → toId 的边」是否会成环。
  * 若成环，返回完整闭环节点序列 [fromId, toId, …, fromId]

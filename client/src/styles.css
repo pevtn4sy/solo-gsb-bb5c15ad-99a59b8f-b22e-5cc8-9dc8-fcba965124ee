@@ -210,6 +210,11 @@ body {
   border: 1px dashed var(--accent);
 }
 
+.link-hint.merge-hint {
+  background: rgba(168, 139, 255, 0.12);
+  border-color: #b18cff;
+}
+
 @keyframes pulse-border {
   0%, 100% { box-shadow: 0 0 0 0 rgba(255, 92, 108, 0.35); }
   50% { box-shadow: 0 0 0 6px rgba(255, 92, 108, 0); }
@@ -459,6 +464,27 @@ body {
   color: var(--accent);
   border-top: 1px dashed var(--border);
   padding-top: 6px;
+}
+
+.target-hint.merge-hint-inline {
+  color: #b18cff;
+}
+
+/* 合并重复证据：源卡片（将删除，紫色实心描边）与候选保留卡片（紫色虚线） */
+.card.merge-source {
+  border-color: #b18cff;
+  box-shadow: 0 0 0 3px rgba(177, 140, 255, 0.25);
+}
+
+.card.merge-pick {
+  cursor: pointer;
+  border-style: dashed;
+  border-color: #b18cff;
+}
+
+.card.merge-pick:hover {
+  background: #2a2440;
+  box-shadow: 0 0 0 3px rgba(177, 140, 255, 0.18);
 }
 
 .card.in-conflict {
