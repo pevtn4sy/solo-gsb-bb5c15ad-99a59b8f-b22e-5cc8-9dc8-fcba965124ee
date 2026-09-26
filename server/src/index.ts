@@ -3,9 +3,9 @@ import fs from 'node:fs';
 import path from 'node:path';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { db, getEdges, getEvidence } from './db';
-import { cycleAfterAdding, findCycle, findRedundantEdges, planPrune, queryOrder, topoLevels } from './graph';
+import { cycleAfterAdding, findCycle, findRedundantEdges, planMergeEdges, planPrune, queryOrder, topoLevels } from './graph';
 import { resetWithSample, seedIfEmpty } from './seed';
-import type { Evidence, GraphState, OrderQueryResult, OrderWitness, PruneResult, RedundancyReport } from './types';
+import type { Evidence, GraphState, MergeResult, OrderQueryResult, OrderWitness, PruneResult, RedundancyReport } from './types';
 
 const app = express();
 app.use(express.json({ limit: '5mb' }));
@@ -84,6 +84,58 @@ app.delete('/api/evidence/:id', (req, res) => {
   const r = db.prepare('DELETE FROM evidence WHERE id = ?').run(req.params.id);
   if (r.changes === 0) return res.status(404).json({ message: '证据卡片不存在' });
   res.json(buildState());
+});
+
+/* ---------- 重复证据合并 ---------- */
+
+app.post('/api/evidence/merge', (req, res) => {
+  const { sourceId, targetId } = (req.body ?? {}) as Record<string, unknown>;
+  if (typeof sourceId !== 'string' || typeof targetId !== 'string') {
+    return res.status(400).json({ message: 'sourceId 与 targetId 均为必填' });
+  }
+  if (sourceId === targetId) {
+    return res.status(400).json({ message: '源卡片与保留卡片不能是同一张卡片' });
+  }
+  const ids = new Set(getEvidence().map((e) => e.id));
+  if (!ids.has(sourceId) || !ids.has(targetId)) {
+    return res.status(404).json({ message: '证据卡片不存在，请刷新后重试' });
+  }
+
+  const plan = planMergeEdges(getEdges(), sourceId, targetId);
+  if ('cycle' in plan) {
+    // 改接会产生自环（两卡间已有直连）或有向环（一卡沿现有约束可达另一卡）：整体拒绝
+    return res.status(409).json({
+      message: plan.selfLoop
+        ? '两张卡片之间已存在直接连线，合并会产生自环，已整体拒绝'
+        : '合并后两张卡片的约束会构成循环依赖，已整体拒绝',
+      cycle: plan.cycle,
+      selfLoop: plan.selfLoop,
+    });
+  }
+
+  // 单个事务：先删除重复连线中落选者，再把保留的边改接到保留卡，最后删除源卡。
+  // 保留卡自身的标题、来源、时间、描述均不更新；任何一步失败整体回滚。
+  let rewired = 0;
+  let removedDuplicates = 0;
+  const tx = db.transaction(() => {
+    const del = db.prepare('DELETE FROM edges WHERE id = ?');
+    for (const id of plan.deleteIds) {
+      removedDuplicates += del.run(id).changes;
+    }
+    const upd = db.prepare('UPDATE edges SET from_id = ?, to_id = ? WHERE id = ?');
+    for (const r of plan.rewire) {
+      rewired += upd.run(r.fromId, r.toId, r.edge.id).changes;
+    }
+    const r = db.prepare('DELETE FROM evidence WHERE id = ?').run(sourceId);
+    if (r.changes === 0) throw new Error('merge: source evidence disappeared');
+  });
+  tx();
+
+  const result: MergeResult = {
+    ...buildState(),
+    merged: { sourceId, targetId, rewired, removedDuplicates },
+  };
+  res.json(result);
 });
 
 /* ---------- 「必须早于」连线 ---------- */

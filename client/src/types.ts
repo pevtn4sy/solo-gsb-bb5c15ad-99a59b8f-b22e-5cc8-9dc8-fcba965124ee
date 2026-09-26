@@ -68,3 +68,8 @@ export interface OrderQueryResult {
   /** relation 为 unconstrained 时：双向见证 */
   witnesses: { aFirst: OrderWitness; bFirst: OrderWitness } | null;
 }
+
+/** 重复证据合并结果：最新全量状态 + 改接 / 删除的连线数量 */
+export interface MergeResult extends GraphState {
+  merged: { sourceId: string; targetId: string; rewired: number; removedDuplicates: number };
+}

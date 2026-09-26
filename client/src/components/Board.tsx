@@ -19,9 +19,16 @@ interface BoardProps {
   orderPath: string[] | null;
   /** 顺序查询：按见证拓扑临时预览画布布局（不写数据库） */
   preview: OrderWitness | null;
+  /** 重复证据合并模式下的两张已选卡片（源卡 / 保留卡）；null 表示未进入合并模式 */
+  mergeSel: { sourceId: string | null; targetId: string | null } | null;
   onStartLink: (id: string) => void;
   onCancelLink: () => void;
   onConnect: (fromId: string, toId: string) => void;
+  /** 进入合并模式并预选源卡（点击卡片上的「合并」按钮） */
+  onMergeStart: (sourceId: string) => void;
+  onMergeCancel: () => void;
+  /** 合并模式下点击画布卡片：选择 / 取消源卡或保留卡 */
+  onMergePick: (id: string) => void;
   onEdit: (ev: Evidence) => void;
   onDelete: (ev: Evidence) => void;
   onDeleteEdge: (id: number) => void;
@@ -93,14 +100,16 @@ export default function Board(props: BoardProps) {
   const conflictEdgeKeys = useMemo(() => {
     const s = new Set<string>();
     if (conflict) {
-      // cycle = [尝试的起点, 尝试的终点, …, 起点]；跳过首对（那是被拒绝的新边），其余为图中已有边
-      for (let i = 1; i < conflict.cycle.length - 1; i++) {
+      // 普通连线冲突：cycle = [尝试的起点, 尝试的终点, …, 起点]，跳过首对（被拒绝的新边）；
+      // 合并冲突：cycle 为源卡与保留卡之间现存的约束路径，每条相邻对都是图中已有边
+      const startI = conflict.kind === 'merge' ? 0 : 1;
+      for (let i = startI; i < conflict.cycle.length - 1; i++) {
         s.add(`${conflict.cycle[i]}->${conflict.cycle[i + 1]}`);
       }
     }
     return s;
   }, [conflict]);
-  const attempted = conflict && conflict.cycle.length >= 2 ? { from: conflict.cycle[0], to: conflict.cycle[1] } : null;
+  const attempted = conflict && conflict.cycle.length >= 2 && conflict.kind !== 'merge' ? { from: conflict.cycle[0], to: conflict.cycle[1] } : null;
 
   /* 瘦身高亮：原连线（琥珀色）+ 替代路径经过的边与节点（绿色） */
   const pruneAltEdgeKeys = useMemo(() => {
@@ -152,7 +161,7 @@ export default function Board(props: BoardProps) {
     ro.observe(board);
     board.querySelectorAll('[data-card-id]').forEach((el) => ro.observe(el));
     return () => ro.disconnect();
-  }, [state, conflict, linkFrom, props.preview]);
+  }, [state, conflict, linkFrom, props.preview, props.mergeSel]);
 
   const toBoardPoint = (e: ReactPointerEvent) => {
     const board = boardRef.current!;
@@ -161,6 +170,7 @@ export default function Board(props: BoardProps) {
   };
 
   const startLinkDrag = (e: ReactPointerEvent, id: string) => {
+    if (props.mergeSel) return;
     e.preventDefault();
     e.stopPropagation();
     boardRef.current?.setPointerCapture(e.pointerId);
@@ -190,6 +200,10 @@ export default function Board(props: BoardProps) {
   };
 
   const onCardClick = (ev: Evidence) => {
+    if (props.mergeSel) {
+      props.onMergePick(ev.id);
+      return;
+    }
     if (!linkFrom) return;
     if (linkFrom === ev.id) props.onCancelLink();
     else props.onConnect(linkFrom, ev.id);
@@ -302,6 +316,9 @@ export default function Board(props: BoardProps) {
               const inConflict = conflictNodes.has(ev.id);
               const isSource = linkFrom === ev.id;
               const isTarget = linkFrom !== null && linkFrom !== ev.id;
+              const isMergeSource = props.mergeSel?.sourceId === ev.id;
+              const isMergeTarget = props.mergeSel?.targetId === ev.id;
+              const isMergePickable = props.mergeSel !== null && !isMergeSource && !isMergeTarget;
               const isPruneEndpoint =
                 props.pruneFocus !== null && (props.pruneFocus.fromId === ev.id || props.pruneFocus.toId === ev.id);
               const isPrunePath = !isPruneEndpoint && prunePathNodes.has(ev.id);
@@ -315,6 +332,9 @@ export default function Board(props: BoardProps) {
                     inConflict ? 'in-conflict' : '',
                     isSource ? 'link-source' : '',
                     isTarget ? 'link-target' : '',
+                    isMergeSource ? 'merge-source' : '',
+                    isMergeTarget ? 'merge-target' : '',
+                    isMergePickable ? 'merge-pickable' : '',
                     isPruneEndpoint ? 'prune-endpoint' : '',
                     isPrunePath ? 'prune-path' : '',
                     isOrderPath ? 'order-path' : '',
@@ -323,6 +343,11 @@ export default function Board(props: BoardProps) {
                     .join(' ')}
                   onClick={() => onCardClick(ev)}
                 >
+                  {(isMergeSource || isMergeTarget) && (
+                    <div className={`merge-role${isMergeSource ? ' source' : ' target'}`}>
+                      {isMergeSource ? '① 源卡片（将被合并删除）' : '② 保留卡片（信息不变）'}
+                    </div>
+                  )}
                   <h3 className="card-title">{ev.title}</h3>
                   <div className="card-meta">
                     {fmtTime(ev.occurredAt) && <span className="chip">🕒 {fmtTime(ev.occurredAt)}</span>}
@@ -352,11 +377,23 @@ export default function Board(props: BoardProps) {
                       className={`btn small link${isSource ? ' active' : ''}`}
                       title="拖拽到另一张卡片，或点击后再点目标卡片"
                       onPointerDown={(e) => startLinkDrag(e, ev.id)}
+                      disabled={props.mergeSel !== null}
                     >
                       ⇢ 连线
                     </button>
+                    <button
+                      className={`btn small merge${isMergeSource ? ' active' : ''}`}
+                      title="把这张重复卡片合并进另一张：先点此键，再点保留卡片"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        props.onMergeStart(ev.id);
+                      }}
+                    >
+                      ▥ 合并
+                    </button>
                   </div>
                   {isTarget && <div className="target-hint">点击：使「{byId.get(linkFrom!)?.title}」必须早于本卡</div>}
+                  {isMergePickable && <div className="target-hint merge-hint">点击：把「{byId.get(props.mergeSel!.sourceId ?? '')?.title ?? '源卡'}」合并进本卡</div>}
                 </article>
               );
             })}

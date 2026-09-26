@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from './api';
 import Board from './components/Board';
 import CardForm from './components/CardForm';
@@ -11,6 +11,15 @@ import type { Evidence, EvidenceFormValues, GraphState, OrderWitness, RedundantE
 export interface Conflict {
   cycle: string[];
   message: string;
+  /** merge：重复证据合并被拒绝（cycle 为源卡与保留卡之间现存的冲突路径） */
+  kind?: 'edge' | 'merge';
+  selfLoop?: boolean;
+}
+
+/** 合并模式下的两张已选卡片 */
+interface MergeSel {
+  sourceId: string | null;
+  targetId: string | null;
 }
 
 export default function App() {
@@ -20,6 +29,7 @@ export default function App() {
   const [linkFrom, setLinkFrom] = useState<string | null>(null);
   const [editing, setEditing] = useState<Evidence | 'new' | null>(null);
   const [busy, setBusy] = useState(false);
+  const [mergeSel, setMergeSel] = useState<MergeSel | null>(null);
   const [redundant, setRedundant] = useState<RedundantEdge[]>([]);
   const [pruneFocus, setPruneFocus] = useState<RedundantEdge | null>(null);
   /** 顺序查询：画布上高亮的依据路径 / 正在预览的见证布局 */
@@ -59,32 +69,39 @@ export default function App() {
         setEditing(null);
         setOrderPath(null);
         setOrderPreview(null);
+        setMergeSel(null);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
   }, []);
 
-  const handleApiError = useCallback((e: unknown) => {
+  const handleApiError = useCallback((e: unknown, kind: Conflict['kind'] = 'edge') => {
     if (e instanceof ApiError && e.payload.cycle) {
-      setConflict({ cycle: e.payload.cycle, message: e.payload.message ?? e.message });
+      setConflict({
+        cycle: e.payload.cycle,
+        message: e.payload.message ?? e.message,
+        kind,
+        selfLoop: e.payload.selfLoop,
+      });
       setError(null);
     } else {
       setError(e instanceof Error ? e.message : '操作失败');
     }
   }, []);
 
-  /** 执行一次会改变图状态的操作；成功后清除冲突高亮与连线模式 */
+  /** 执行一次会改变图状态的操作；成功后清除冲突高亮、连线与合并模式 */
   const run = useCallback(
-    async (fn: () => Promise<GraphState>) => {
+    async (fn: () => Promise<GraphState>, conflictKind: Conflict['kind'] = 'edge') => {
       setBusy(true);
       try {
         setState(await fn());
         setConflict(null);
         setLinkFrom(null);
+        setMergeSel(null);
         setError(null);
       } catch (e) {
-        handleApiError(e);
+        handleApiError(e, conflictKind);
       } finally {
         setBusy(false);
       }
@@ -161,6 +178,80 @@ export default function App() {
     void run(() => api.pruneEdges(redundant.map((r) => r.edgeId)));
   }, [redundant, run]);
 
+  /* ---------- 重复证据合并 ---------- */
+
+  /** 点击卡片上的「合并」：进入合并模式并把该卡设为源卡（再次点击同一卡则退出） */
+  const startMerge = useCallback(
+    (sourceId: string) => {
+      setConflict(null);
+      setError(null);
+      setLinkFrom(null);
+      setMergeSel((cur) => (cur?.sourceId === sourceId && cur.targetId === null ? null : { sourceId, targetId: null }));
+    },
+    [],
+  );
+
+  /** 合并模式下点击画布卡片：依次选择源卡、保留卡；再次点击已选角色可取消 */
+  const pickMerge = useCallback((id: string) => {
+    setConflict(null);
+    setMergeSel((cur) => {
+      if (!cur) return cur;
+      if (cur.sourceId === id) return { sourceId: null, targetId: cur.targetId };
+      if (cur.targetId === id) return { sourceId: cur.sourceId, targetId: null };
+      if (cur.sourceId === null) return { sourceId: id, targetId: cur.targetId };
+      if (cur.targetId === null) return { sourceId: cur.sourceId, targetId: id };
+      return cur;
+    });
+  }, []);
+
+  const swapMerge = useCallback(() => {
+    setMergeSel((cur) => (cur ? { sourceId: cur.targetId, targetId: cur.sourceId } : cur));
+  }, []);
+
+  /** 预览改接影响：模拟「源卡端点改接到保留卡 + 重复连线只留一条」后的连线集合 */
+  const mergePreview = useMemo(() => {
+    if (!state || !mergeSel?.sourceId || !mergeSel.targetId) return null;
+    const s = mergeSel.sourceId;
+    const t = mergeSel.targetId;
+    const seen = new Set<string>();
+    let rewired = 0;
+    let duplicates = 0;
+    for (const e of state.edges) {
+      const touches = e.fromId === s || e.toId === s;
+      const f = e.fromId === s ? t : e.fromId;
+      const g = e.toId === s ? t : e.toId;
+      const key = `${f}->${g}`;
+      if (seen.has(key)) {
+        if (touches) duplicates++;
+        continue;
+      }
+      seen.add(key);
+      if (touches) rewired++;
+    }
+    return { rewired, duplicates };
+  }, [state, mergeSel]);
+
+  const confirmMerge = useCallback(() => {
+    if (!mergeSel?.sourceId || !mergeSel.targetId) return;
+    const { sourceId, targetId } = mergeSel;
+    const src = state?.evidence.find((e) => e.id === sourceId);
+    const keep = state?.evidence.find((e) => e.id === targetId);
+    if (!src || !keep) return;
+    const dupNote = mergePreview && mergePreview.duplicates > 0 ? `其中 ${mergePreview.duplicates} 条重复连线将只保留一条。` : '';
+    if (
+      !window.confirm(
+        `将把源卡片「${src.title}」合并进保留卡片「${keep.title}」：\n\n` +
+          `· 源卡片的全部入边 / 出边（${mergePreview?.rewired ?? 0} 条）将改接到保留卡片；${dupNote}\n` +
+          `· 合并完成后删除源卡片；\n` +
+          `· 保留卡片的标题、来源、发生时间和描述保持不变。\n\n` +
+          `确定合并？`,
+      )
+    ) {
+      return;
+    }
+    void run(() => api.mergeEvidence(sourceId, targetId), 'merge');
+  }, [mergeSel, state, mergePreview, run]);
+
   const titleOf = useCallback(
     (id: string) => state?.evidence.find((e) => e.id === id)?.title ?? id.slice(0, 8),
     [state],
@@ -214,6 +305,49 @@ export default function App() {
 
       {conflict && <ConflictBanner conflict={conflict} titleOf={titleOf} onClose={() => setConflict(null)} />}
 
+      {mergeSel && state && (
+        <div className="merge-banner">
+          <div className="merge-banner-main">
+            <strong>重复证据合并</strong>
+            <span className="merge-row">
+              {mergeSel.sourceId ? (
+                <>
+                  ① 源卡片（合并后删除）：<b className="ms">{titleOf(mergeSel.sourceId)}</b>
+                </>
+              ) : (
+                <span className="muted">① 点击一张卡片作为源卡片（将被合并删除）</span>
+              )}
+            </span>
+            <span className="merge-row">
+              {mergeSel.targetId ? (
+                <>
+                  ② 保留卡片（标题 / 来源 / 时间 / 描述不变）：<b className="mt">{titleOf(mergeSel.targetId)}</b>
+                </>
+              ) : (
+                <span className="muted">② 点击另一张卡片作为保留卡片</span>
+              )}
+            </span>
+            {mergeSel.sourceId && mergeSel.targetId && mergePreview && (
+              <span className="muted">
+                将把源卡片的 {mergePreview.rewired} 条入 / 出边改接到保留卡片
+                {mergePreview.duplicates > 0 ? `，${mergePreview.duplicates} 条重复连线只保留一条` : ''}，随后删除源卡片。
+              </span>
+            )}
+          </div>
+          <div className="merge-banner-actions">
+            <button type="button" className="btn" onClick={swapMerge} disabled={!mergeSel.sourceId || !mergeSel.targetId || busy} title="交换源卡片与保留卡片">
+              ⇄ 对调
+            </button>
+            <button type="button" className="btn" onClick={() => setMergeSel(null)} disabled={busy}>
+              取消
+            </button>
+            <button type="button" className="btn danger-solid" onClick={confirmMerge} disabled={busy || !mergeSel.sourceId || !mergeSel.targetId}>
+              确认合并
+            </button>
+          </div>
+        </div>
+      )}
+
       {state && (
         <PrunePanel
           redundant={redundant}
@@ -264,9 +398,13 @@ export default function App() {
               pruneFocus={pruneFocus}
               orderPath={orderPath}
               preview={orderPreview}
+              mergeSel={mergeSel}
               onStartLink={setLinkFrom}
               onCancelLink={() => setLinkFrom(null)}
               onConnect={connect}
+              onMergeStart={startMerge}
+              onMergeCancel={() => setMergeSel(null)}
+              onMergePick={pickMerge}
               onEdit={setEditing}
               onDelete={deleteCard}
               onDeleteEdge={deleteEdge}

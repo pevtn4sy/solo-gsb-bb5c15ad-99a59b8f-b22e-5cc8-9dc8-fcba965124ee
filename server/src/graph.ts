@@ -224,6 +224,86 @@ export function queryOrder(nodes: OrderableNode[], edges: EdgeLike[], aId: strin
   return { relation: 'unconstrained', path: null, witnesses: { aFirst, bFirst } };
 }
 
+/* ---------- 重复证据合并 ---------- */
+
+export interface RewiredEdge<T extends EdgeLike> {
+  edge: T;
+  fromId: string;
+  toId: string;
+}
+
+export type MergePlan<T extends EdgeLike> = {
+  /** 需改接到保留卡的边及其新端点（createdAt 等原有属性保持不变） */
+  rewire: Array<RewiredEdge<T>>;
+  /** 改接后产生重复连线而需删除的边 id（每对重复端点只留一条） */
+  deleteIds: number[];
+};
+
+export type MergeConflictResult =
+  | { selfLoop: true; cycle: string[] }
+  | { selfLoop: false; cycle: string[] };
+
+/**
+ * 规划「把 sourceId 卡合并进 targetId 卡」：
+ * 源卡的所有入边、出边改接到保留卡；改接后端点相同的重复连线只保留一条
+ * （保留 id 最小、即最早创建的一条）。若改接会产生：
+ * - 自环（两卡之间已存在直连边，改接后端点重合）：返回长度 2 的冲突路径；
+ * - 有向环（一卡沿现有约束可达另一卡）：返回原图层的冲突路径
+ *   （一条 source → … → target 或 target → … → source 的路径，合并后首尾重合即闭环）。
+ * 图本身保持不变，由调用方在单个事务内按计划落库。
+ */
+export function planMergeEdges<T extends EdgeLike & { id: number }>(
+  edges: T[],
+  sourceId: string,
+  targetId: string,
+): MergePlan<T> | MergeConflictResult {
+  // 冲突判定（原图恒为 DAG）：把两个节点识别为同一个会产生环，
+  // 当且仅当原图中二者之一可达另一个——识别后该路径首尾重合即闭环；
+  // 直连边（路径长度 1）改接后就是自环。直接返回原图层的冲突路径用于高亮。
+  const forward = findPath(edges, sourceId, targetId);
+  if (forward) return { selfLoop: forward.length === 2, cycle: forward };
+  const backward = findPath(edges, targetId, sourceId);
+  if (backward) return { selfLoop: backward.length === 2, cycle: backward };
+
+  // 候选最终边：未触及源卡的边保持不变，触及源卡的边把源卡端点改接到保留卡
+  interface Cand {
+    edge: T;
+    touched: boolean;
+    fromId: string;
+    toId: string;
+  }
+  const candidates: Cand[] = edges.map((e) => {
+    const touched = e.fromId === sourceId || e.toId === sourceId;
+    return {
+      edge: e,
+      touched,
+      fromId: e.fromId === sourceId ? targetId : e.fromId,
+      toId: e.toId === sourceId ? targetId : e.toId,
+    };
+  });
+
+  // 重复连线：按最终端点对去重，每对只留 id 最小（最早创建）的一条
+  const bestByKey = new Map<string, Cand>();
+  for (const c of candidates) {
+    const key = `${c.fromId}->${c.toId}`;
+    const cur = bestByKey.get(key);
+    if (!cur || c.edge.id < cur.edge.id) bestByKey.set(key, c);
+  }
+  const keptIds = new Set([...bestByKey.values()].map((c) => c.edge.id));
+  // 落榜边可能是被改接边（源卡入/出边），也可能是与改接边撞端点的保留卡原有边
+  const deleteIds = edges
+    .filter((e) => !keptIds.has(e.id))
+    .map((e) => e.id)
+    .sort((a, b) => a - b);
+
+  return {
+    rewire: [...bestByKey.values()]
+      .filter((c) => c.touched)
+      .map((c) => ({ edge: c.edge, fromId: c.fromId, toId: c.toId })),
+    deleteIds,
+  };
+}
+
 /**
  * 在已有图中寻找一个环（用于导入快照校验）。
  * 返回闭环节点序列 [n, …, n]；无环返回 null。

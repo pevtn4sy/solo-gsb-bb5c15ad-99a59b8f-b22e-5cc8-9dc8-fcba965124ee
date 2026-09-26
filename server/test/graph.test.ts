@@ -5,6 +5,7 @@ import {
   findCycle,
   findPath,
   findRedundantEdges,
+  planMergeEdges,
   planPrune,
   queryOrder,
   stableTopoOrder,
@@ -276,4 +277,144 @@ test('queryOrder：顺序未被约束时给出双向见证拓扑序', () => {
 
 test('queryOrder：同一卡片返回 null', () => {
   assert.equal(queryOrder(nodesOf(['a']), [], 'a', 'a'), null);
+});
+
+/* ---------- 重复证据合并 ---------- */
+
+interface TE {
+  id: number;
+  fromId: string;
+  toId: string;
+}
+
+const E = (id: number, fromId: string, toId: string): TE => ({ id, fromId, toId });
+
+test('planMergeEdges：源卡的入边与出边改接到保留卡', () => {
+  const edges = [E(1, 'p', 's'), E(2, 's', 'q'), E(3, 'q', 'r')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('rewire' in plan);
+  if (!('rewire' in plan)) return;
+  assert.deepEqual(
+    plan.rewire.map((x) => [x.edge.id, x.fromId, x.toId]),
+    [
+      [1, 'p', 't'],
+      [2, 't', 'q'],
+    ],
+  );
+  assert.deepEqual(plan.deleteIds, []);
+});
+
+test('planMergeEdges：改接后重复连线只保留 id 最小的一条', () => {
+  // 源卡入边 p→s 改接为 p→t，与已存在的 p→t(id 2) 撞端点：保留 id 1，删除 id 2
+  const edges = [E(1, 'p', 's'), E(2, 'p', 't'), E(3, 's', 'q')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('rewire' in plan);
+  if (!('rewire' in plan)) return;
+  assert.deepEqual(
+    plan.rewire.map((x) => [x.edge.id, x.fromId, x.toId]),
+    [
+      [1, 'p', 't'],
+      [3, 't', 'q'],
+    ],
+  );
+  assert.deepEqual(plan.deleteIds, [2]);
+});
+
+test('planMergeEdges：重复出边同样去重；改接边 id 更大时保留原有边', () => {
+  // s→q(id 1) 改接为 t→q，与已存在的 t→q(id 2) 撞端点：id 1 更小，删除 id 2
+  const edges = [E(1, 's', 'q'), E(2, 't', 'q'), E(3, 'p', 's')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('rewire' in plan);
+  if (!('rewire' in plan)) return;
+  assert.deepEqual(
+    plan.rewire.map((x) => [x.edge.id, x.fromId, x.toId]).sort(),
+    [
+      [1, 't', 'q'],
+      [3, 'p', 't'],
+    ],
+  );
+  assert.deepEqual(plan.deleteIds, [2]);
+});
+
+test('planMergeEdges：双向重复（入边与出边都有撞端点）各自去重', () => {
+  const edges = [E(1, 'p', 's'), E(2, 'p', 't'), E(3, 's', 'q'), E(4, 't', 'q')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('rewire' in plan);
+  if (!('rewire' in plan)) return;
+  assert.deepEqual(plan.deleteIds.sort(), [2, 4]);
+  assert.deepEqual(
+    plan.rewire.map((x) => [x.edge.id, x.fromId, x.toId]).sort(),
+    [
+      [1, 'p', 't'],
+      [3, 't', 'q'],
+    ],
+  );
+});
+
+test('planMergeEdges：两卡间直连边改接会产生自环，返回长度 2 的冲突路径', () => {
+  const edges = [E(1, 's', 't'), E(2, 't', 'q')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.deepEqual(plan, { selfLoop: true, cycle: ['s', 't'] });
+});
+
+test('planMergeEdges：反向直连边同样是自环', () => {
+  const edges = [E(1, 't', 's')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.deepEqual(plan, { selfLoop: true, cycle: ['t', 's'] });
+});
+
+test('planMergeEdges：源卡可达保留卡（非直连），合并成环，返回原图层冲突路径', () => {
+  // s → a → t：合并 s 进 t 后 t → a → t 成环
+  const edges = [E(1, 's', 'a'), E(2, 'a', 't'), E(3, 't', 'q')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('cycle' in plan && !plan.selfLoop);
+  if (!('cycle' in plan)) return;
+  assert.deepEqual(plan.cycle, ['s', 'a', 't']);
+});
+
+test('planMergeEdges：保留卡可达源卡，返回反向冲突路径', () => {
+  // t → a → b → s：合并后 s(t) → a → b → t 成环
+  const edges = [E(1, 't', 'a'), E(2, 'a', 'b'), E(3, 'b', 's')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('cycle' in plan && !plan.selfLoop);
+  if (!('cycle' in plan)) return;
+  assert.deepEqual(plan.cycle, ['t', 'a', 'b', 's']);
+});
+
+test('planMergeEdges：公共前后缀（菱形）合并不成环，改接后仍为 DAG', () => {
+  // t 与 s 都在 p 之后、q 之前：p→t, p→s, t→q, s→q —— 互相不可达，合并安全
+  const edges = [E(1, 'p', 't'), E(2, 'p', 's'), E(3, 't', 'q'), E(4, 's', 'q')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('rewire' in plan);
+  if (!('rewire' in plan)) return;
+  // id2 改接为 p→t 与 id1 撞端点 → 删 id2；id4 改接为 t→q 与 id3 撞端点 → 删 id4
+  assert.deepEqual(plan.deleteIds, [2, 4]);
+  const rewired = new Map(plan.rewire.map((r) => [r.edge.id, r]));
+  const after = edges
+    .filter((e) => !plan.deleteIds.includes(e.id))
+    .map((e) => {
+      const r = rewired.get(e.id);
+      return r ? { id: e.id, fromId: r.fromId, toId: r.toId } : e;
+    });
+  assert.deepEqual(
+    after.map((e) => [e.fromId, e.toId]).sort(),
+    [
+      ['p', 't'],
+      ['t', 'q'],
+    ],
+  );
+  assert.ok(after.every((e) => e.fromId !== e.toId));
+  assert.equal(findCycle(['p', 't', 'q'], after), null);
+});
+
+test('planMergeEdges：与两卡均无关的连线既不改接也不删除', () => {
+  const edges = [E(1, 'a', 'b'), E(2, 'b', 'c'), E(3, 's', 'd')];
+  const plan = planMergeEdges(edges, 's', 't');
+  assert.ok('rewire' in plan);
+  if (!('rewire' in plan)) return;
+  assert.deepEqual(
+    plan.rewire.map((x) => [x.edge.id, x.fromId, x.toId]),
+    [[3, 't', 'd']],
+  );
+  assert.deepEqual(plan.deleteIds, []);
 });
